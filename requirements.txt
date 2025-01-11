@@ -1,0 +1,9 @@
+kubernetes
+streamlit
+faiss-cpu
+sentence-transformers
+requests
+python-dotenv
+matplotlib
+numpy
+pandas
