@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  create-release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    # if: github.ref == 'refs/heads/prod'
+    # needs: [ build ]
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Get Commit Message
+      id: commit-message
+      run: |
+        commit_message=$(git log -1 --pretty=%B | tr '\n' ' ')
+        echo "commit_message<<EOF" >> $GITHUB_OUTPUT
+        echo "${commit_message}" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+
+    - name: Generate Release Version
+      id: release-version
+      run: |
+        version="1.0.${GITHUB_RUN_NUMBER}"
+        echo "version=$version" >> $GITHUB_OUTPUT
+        echo "Release version: $version"
+
+    - name: Create Package
+      run: |
+        mkdir -p build
+        zip -r build/package-${{ steps.release-version.outputs.version }}.zip .
+        echo "Package created: build/package-${{ steps.release-version.outputs.version }}.zip"
+
+    - name: Create GitHub Release
+      id: create-release
+      uses: actions/create-release@v1
+      with:
+        tag_name: "v${{ steps.release-version.outputs.version }}"
+        release_name: "Release v${{ steps.release-version.outputs.version }}"
+        body: ${{ steps.commit-message.outputs.commit_message }}
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Upload Release Asset
+      uses: actions/upload-release-asset@v1
+      with:
+        upload_url: ${{ steps.create-release.outputs.upload_url }}
+        asset_path: build/package-${{ steps.release-version.outputs.version }}.zip
+        asset_name: package-${{ steps.release-version.outputs.version }}.zip
+        asset_content_type: application/zip
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
