@@ -5,6 +5,7 @@
 
 ## **📖 Overview**
 This project is a **real-time Kubernetes anomaly detection dashboard** that enables engineers to:
+
 ✅ **Fetch logs from all Kubernetes pods dynamically**  
 ✅ **Search logs instantly using FAISS**  
 ✅ **Detect anomalies in real-time using TF-IDF & K-Means**  
