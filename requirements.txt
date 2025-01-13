@@ -7,3 +7,4 @@ python-dotenv
 matplotlib
 numpy
 pandas
+prometheus_client

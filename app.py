@@ -1,19 +1,20 @@
 import streamlit as st
 import re
-import faiss
 import json
-import requests
 import numpy as np
 import pandas as pd
 import time
-import matplotlib.pyplot as plt
+import sqlite3
+from datetime import datetime
 from sentence_transformers import SentenceTransformer
 from kubernetes import client, config
-import smtplib
-from email.mime.text import MIMEText
-from datetime import datetime
 import os
 from dotenv import load_dotenv
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.cluster import KMeans
+from collections import Counter
+import requests
+import matplotlib.pyplot as plt
 
 # Load environment variables
 load_dotenv()
@@ -21,13 +22,9 @@ load_dotenv()
 # Set API keys & configurations
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_ENDPOINT = os.getenv("GROQ_ENDPOINT")
+USE_GROQ = os.getenv("USE_GROQ", "False").lower() == "true"  # Toggle AI calls
+ANOMALY_THRESHOLD = int(os.getenv("ANOMALY_THRESHOLD", 3))  # Threshold for anomaly alerts
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
-EMAIL_ALERTS_ENABLED = os.getenv("EMAIL_ALERTS_ENABLED") == "True"
-SMTP_SERVER = os.getenv("SMTP_SERVER")
-SMTP_PORT = os.getenv("SMTP_PORT")
-EMAIL_SENDER = os.getenv("EMAIL_SENDER")
-EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
-EMAIL_RECEIVER = os.getenv("EMAIL_RECEIVER")
 
 # Load Kubernetes configuration
 config.load_kube_config()
@@ -36,18 +33,49 @@ v1 = client.CoreV1Api()
 # Load Sentence Transformer Model
 embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
 
-# FAISS Index (for Storing & Retrieving Logs)
-vector_dim = 384
-index = faiss.IndexFlatL2(vector_dim)
-log_texts = []
-log_data = []
-anomaly_logs = []
+# SQLite Database Setup
+DB_FILE = "k8s_logs.db"
 
-# Streamlit UI Setup
-st.set_page_config(page_title="Kubernetes Anomaly Alerts", layout="wide")
+def init_db():
+    """Initialize the SQLite database."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('''CREATE TABLE IF NOT EXISTS logs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        pod TEXT,
+                        namespace TEXT,
+                        log TEXT,
+                        timestamp TEXT
+                      )''')
+    conn.commit()
+    conn.close()
 
-st.title("🚨 Kubernetes Anomaly Detection Dashboard")
-st.markdown("Real-time monitoring and AI-based anomaly detection with **Slack Alerts**.")
+init_db()
+
+# Function to Insert Logs into SQLite
+def save_logs_to_db(logs):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    for log in logs:
+        cursor.execute("INSERT INTO logs (pod, namespace, log, timestamp) VALUES (?, ?, ?, ?)", 
+                       (log["pod"], log["namespace"], log["log"], log["timestamp"]))
+    conn.commit()
+    conn.close()
+
+# Function to Fetch Logs from SQLite
+def get_recent_logs(limit=100):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM logs ORDER BY id DESC LIMIT ?", (limit,))
+    logs = [{"pod": row[1], "namespace": row[2], "log": row[3], "timestamp": row[4]} for row in cursor.fetchall()]
+    conn.close()
+    return logs
+
+# 📌 Slack Notification
+def send_slack_notification(message):
+    if SLACK_WEBHOOK_URL:
+        payload = {"text": message}
+        requests.post(SLACK_WEBHOOK_URL, json=payload)
 
 # 📌 Fetch Logs from Kubernetes API
 def fetch_live_k8s_logs():
@@ -64,9 +92,10 @@ def fetch_live_k8s_logs():
         except Exception:
             pass  # Skip pods with no logs
 
+    save_logs_to_db(logs)  # Save logs to SQLite
     return logs
 
-# 📌 Extract Errors & Warnings
+# 📌 Extract Errors & Warnings Locally
 def extract_errors_warnings(logs):
     error_patterns = [
         r'(?i)\b(error|failed|exception|crash|critical)\b',
@@ -76,50 +105,47 @@ def extract_errors_warnings(logs):
     
     return [log for log in logs if any(re.search(pattern, log["log"]) for pattern in error_patterns)]
 
-# 📌 Store Logs in FAISS for Search
-def store_logs_as_vectors(logs):
-    global log_texts, log_data
-
-    if not logs:  # Ensure logs are available before processing
-        return
+# 📌 Local Anomaly Detection using TF-IDF and K-Means Clustering
+def detect_anomalies_locally(logs, n_clusters=3):
+    if not logs:
+        return "No logs available for anomaly detection."
 
     log_texts = [log["log"] for log in logs]
-    log_data = logs  # Store structured logs
-
-    embeddings = embedding_model.encode(log_texts, convert_to_numpy=True)
     
-    # Clear FAISS index before re-adding
-    index.reset()  
-    index.add(embeddings)  
+    # Vectorize logs using TF-IDF
+    vectorizer = TfidfVectorizer(stop_words='english', max_features=500)
+    log_vectors = vectorizer.fit_transform(log_texts)
 
-# 📌 Retrieve Relevant Logs Safely
-def retrieve_relevant_logs(query, top_k=5):
-    if index.ntotal == 0:  # Check if FAISS index is empty
-        return []  # Return empty list if no logs are indexed
+    # Apply K-Means Clustering
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+    clusters = kmeans.fit_predict(log_vectors)
 
-    query_embedding = embedding_model.encode([query], convert_to_numpy=True)
-    distances, indices = index.search(query_embedding, top_k)
+    # Find the smallest cluster (potential anomalies)
+    cluster_counts = Counter(clusters)
+    anomaly_cluster = min(cluster_counts, key=cluster_counts.get)
 
-    # Ensure indices are valid before retrieving logs
-    valid_results = [log_data[i] for i in indices[0] if i < len(log_data)]
-    return valid_results
+    anomaly_logs = [logs[i] for i in range(len(logs)) if clusters[i] == anomaly_cluster]
+    
+    return anomaly_logs if anomaly_logs else "No anomalies detected."
 
-# 📌 AI-Based Anomaly Detection
-def detect_anomalies(logs):
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+# 📌 AI-Based Anomaly Detection (Only Sends Logs to Groq if Necessary)
+def detect_anomalies_ai(logs):
+    if not USE_GROQ:
+        return "Groq API calls are disabled. Using local anomaly detection."
 
     if not logs:
         return "No logs available for anomaly detection."
 
-    max_logs = 50
-    trimmed_logs = logs[:max_logs]
-    logs_text = "\n".join([log["log"][:500] for log in trimmed_logs])
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    
+    max_logs = min(50, len(logs))
+    logs_text = "\n".join([log["log"][:500] for log in logs[:max_logs]])
 
     payload = {
         "model": "mixtral-8x7b-32768",
         "messages": [
             {"role": "system", "content": "You are an AI that detects anomalies in Kubernetes logs."},
-            {"role": "user", "content": f"Identify unusual patterns in these logs (showing {max_logs} logs):\n\n{logs_text}"}
+            {"role": "user", "content": f"Identify unusual patterns in these logs:\n\n{logs_text}"}
         ],
         "max_tokens": 500
     }
@@ -130,77 +156,94 @@ def detect_anomalies(logs):
         return response.json()["choices"][0]["message"]["content"]
     else:
         return f"Error: {response.json().get('error', {}).get('message', 'Unknown error')}"
+    
+# 📊 Visualize Log Errors Over Time
+def plot_logs(logs):
+    timestamps = [datetime.strptime(log["timestamp"], "%Y-%m-%d %H:%M:%S") for log in logs]
+    error_counts = list(range(1, len(timestamps) + 1))
 
-# 📌 AI-Powered Log Analysis
-def generate_ai_response(query, relevant_logs):
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    plt.figure(figsize=(10, 4))
+    plt.plot(timestamps, error_counts, marker="o", linestyle="-", label="Log Count", color="red")
+    plt.xlabel("Time")
+    plt.ylabel("Logs Count")
+    plt.title("Log Entries Over Time")
+    plt.xticks(rotation=45)
+    plt.legend()
+    st.pyplot(plt)
 
-    if not relevant_logs:
-        return "No relevant logs found for analysis."
+# 📊 Error Type Distribution
+def plot_error_distribution(errors):
+    error_types = [log["log"].split(" ")[0] for log in errors]  # Extract first word of log
+    error_counts = Counter(error_types)
 
-    max_logs = 10
-    trimmed_logs = relevant_logs[:max_logs]
-    logs_text = "\n".join([log["log"][:500] for log in trimmed_logs])
+    plt.figure(figsize=(10, 5))
+    plt.bar(error_counts.keys(), error_counts.values(), color="blue")
+    plt.xlabel("Error Type")
+    plt.ylabel("Frequency")
+    plt.title("Error Type Distribution")
+    plt.xticks(rotation=45)
+    st.pyplot(plt)
 
-    payload = {
-        "model": "mixtral-8x7b-32768",
-        "messages": [
-            {"role": "system", "content": "You are an AI that analyzes Kubernetes logs and provides insights."},
-            {"role": "user", "content": f"Analyze these logs (showing {max_logs} logs):\n\n{logs_text}"}
-        ],
-        "max_tokens": 500
-    }
-
-    response = requests.post(GROQ_ENDPOINT, headers=headers, data=json.dumps(payload))
-
-    if response.status_code == 200:
-        return response.json()["choices"][0]["message"]["content"]
-    else:
-        return f"Error: {response.json().get('error', {}).get('message', 'Unknown error')}"
+# 🖥️ Streamlit UI Setup
+st.set_page_config(page_title="Kubernetes Anomaly Alerts", layout="wide")
+# st.sidebar.markdown("![Kubernetes Logo](https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcQHyAZraIZcf_GMLOnsw9p-KWVc0LmDFZfvWhLUSjhWt9J-YYraBGSHsqIRDQnjNlAbS3s&usqp=CAU)")
+st.sidebar.image("./images/logo.png", use_container_width=True)
+st.title("🚨 Kubernetes Anomaly Detection Dashboard")
+st.markdown("Real-time monitoring and AI-based anomaly detection.")
 
 # Sidebar Filters
 st.sidebar.header("📊 Log Filters")
 refresh_interval = st.sidebar.slider("⏳ Refresh Interval (seconds)", min_value=5, max_value=60, value=10)
 
-# 📌 Search Query Box
-query = st.text_input("Enter a log query (e.g., 'pod failed')", placeholder="Search logs...")
+# Dropdown for Anomaly Detection Type
+anomaly_detection_method = st.sidebar.selectbox(
+    "🔍 Choose Anomaly Detection Method",
+    ["Local (TF-IDF & K-Means)", "AI (Groq API)"]
+)
 
-if query:
-    if index.ntotal == 0:
-        st.warning("⚠️ No logs available in FAISS index. Try fetching logs first.")
-    else:
-        search_results = retrieve_relevant_logs(query)
-        if search_results:
-            st.subheader("🔍 Relevant Logs")
-            st.code("\n".join([log["log"] for log in search_results]), language="plaintext")
-
-            # AI Insights
-            st.subheader("🤖 AI Log Analysis")
-            ai_response = generate_ai_response(query, search_results)
-            st.text(ai_response)
-        else:
-            st.info("No relevant logs found for the query.")
-
-# Fetch Logs & Store in FAISS
+# Fetch Logs (only once)
 logs = fetch_live_k8s_logs()
-store_logs_as_vectors(logs)
 
-# Detect Anomalies
-anomaly_logs = detect_anomalies(logs)
+# Retrieve Recent Logs from SQLite
+stored_logs = get_recent_logs()
 
-# Display Logs
-st.subheader("📄 Live Kubernetes Logs")
-df = pd.DataFrame(logs)
-st.dataframe(df)
+# Extract Warnings & Errors
+error_logs = extract_errors_warnings(stored_logs)
 
-# Error Count
-error_count = len(extract_errors_warnings(logs))
-st.metric(label="Total Errors & Warnings", value=error_count)
+# Detect Anomalies Based on Selected Method
+if st.sidebar.button("🚀 Run Anomaly Detection"):
+    st.subheader("🚨 Anomaly Detection Results")
+    anomaly_logs = detect_anomalies_locally(stored_logs) if anomaly_detection_method == "Local (TF-IDF & K-Means)" else detect_anomalies_ai(stored_logs)
 
-# Anomaly Detection Results
-st.subheader("🚨 Anomaly Detection")
-st.text(anomaly_logs)
+    st.write(pd.DataFrame(anomaly_logs))
+
+    # Alert if anomalies exceed threshold
+    if len(anomaly_logs) >= ANOMALY_THRESHOLD:
+        alert_msg = f"⚠️ High Anomaly Alert! {len(anomaly_logs)} anomalies found."
+        st.error(alert_msg)
+        send_slack_notification(alert_msg)  # Send Slack Alert
+    
+    st.subheader("📈 Log Trend Analysis")
+    plot_logs(anomaly_logs)
+
+    st.subheader("📊 Error Type Distribution")
+    plot_error_distribution(error_logs)
+else:
+    # if the button is not clicked, only show the recent logs
+    st.subheader("📄 Recent Kubernetes Logs")
+    df = pd.DataFrame(stored_logs)
+    st.dataframe(df)
+    st.metric(label="Total Errors & Warnings", value=len(error_logs))
+    # 📊 Visualization
+    st.subheader("📈 Log Trend Analysis")
+    plot_logs(stored_logs)
+
+    st.subheader("📊 Error Type Distribution")
+    plot_error_distribution(error_logs)
 
 # Auto-refresh data
 time.sleep(refresh_interval)
 st.rerun()
+st.cache.clear()
+st.code("© 2025 - Built with Streamlit & Kubernetes")
+# st.sidebar.markdown("![Kubernetes Logo](https://kubernetes.io/images/favicon.png)")
