@@ -15,6 +15,9 @@ from sklearn.cluster import KMeans
 from collections import Counter
 import requests
 import matplotlib.pyplot as plt
+from prometheus_client import start_http_server, Gauge, REGISTRY, CollectorRegistry
+import threading
+import socket
 
 # Load environment variables
 load_dotenv()
@@ -25,6 +28,40 @@ GROQ_ENDPOINT = os.getenv("GROQ_ENDPOINT")
 USE_GROQ = os.getenv("USE_GROQ", "False").lower() == "true"  # Toggle AI calls
 ANOMALY_THRESHOLD = int(os.getenv("ANOMALY_THRESHOLD", 3))  # Threshold for anomaly alerts
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
+
+# Global registry for Prometheus metrics
+registry = CollectorRegistry()
+
+# Check if port 8090 is already in use
+def is_port_in_use(port):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        return s.connect_ex(("localhost", port)) == 0  # Returns True if port is in use
+
+# Start Prometheus server **only if not already running**
+def start_metrics_server():
+    if os.getenv("METRICS_SERVER", "False").lower() == "true":
+        try:
+            if is_port_in_use(8090):
+                print("✅ Prometheus server is already running on port 8090. Skipping restart.")
+            else:
+                print("🚀 Starting Prometheus server on port 8090...")
+                start_http_server(8090)  # Start the server only if it's not already running
+        except BrokenPipeError:
+            print("⚠️ Warning: Broken pipe detected. Restarting Prometheus server...")
+            os.system("fuser -k 8090/tcp")  # Kill any process using port 8090
+            start_http_server(8090)  # Restart Prometheus server
+
+# Run Prometheus server in a background thread
+if "prometheus_thread" not in globals():
+    prometheus_thread = threading.Thread(target=start_metrics_server, daemon=True)
+    prometheus_thread.start()
+
+# Register metrics **only if not already registered**
+if "log_count_metric" not in globals():
+    anomaly_metric = Gauge("kubernetes_anomalies", "Number of detected anomalies", registry=registry)
+    error_log_metric = Gauge("kubernetes_error_logs", "Total number of error logs", registry=registry)
+    log_count_metric = Gauge("kubernetes_log_count", "Total number of logs processed", registry=registry)
+
 
 # Load Kubernetes configuration
 config.load_kube_config()
@@ -230,17 +267,21 @@ anomaly_detection_method = st.sidebar.selectbox(
 
 # Fetch Logs (only once)
 logs = fetch_live_k8s_logs()
+# log_count_metric.set(len(logs))
 
 # Retrieve Recent Logs from SQLite
 stored_logs = get_recent_logs()
 
 # Extract Warnings & Errors
 error_logs = extract_errors_warnings(stored_logs)
+# error_log_metric.set(len(error_logs))
 
 # Detect Anomalies Based on Selected Method
 if st.sidebar.button("🚀 Run Anomaly Detection"):
     st.subheader("🚨 Anomaly Detection Results")
     anomaly_logs = detect_anomalies_locally(stored_logs) if anomaly_detection_method == "Local (TF-IDF & K-Means)" else detect_anomalies_ai(stored_logs)
+
+    # anomaly_metric.set(len(anomaly_logs))
 
     st.write(pd.DataFrame(anomaly_logs))
 
@@ -269,6 +310,19 @@ else:
 
     st.subheader("📊 Error Type Distribution")
     plot_error_distribution(error_logs)
+
+# Use Metrics
+try:
+    logs = fetch_live_k8s_logs()
+    log_count_metric.set(len(logs))  # ✅ Ensures metrics are defined before use
+
+    error_logs = extract_errors_warnings(logs)
+    error_log_metric.set(len(error_logs))  # ✅ Ensures metrics are defined before use
+
+    anomaly_logs = detect_anomalies_locally(logs) if anomaly_detection_method == "Local (TF-IDF & K-Means)" else detect_anomalies_ai(logs)
+    anomaly_metric.set(len(anomaly_logs))  # ✅ Ensures metrics are defined before use
+except NameError:
+    st.error("Prometheus metrics not initialized properly. Restart the app.")
 
 # Auto-refresh data
 time.sleep(refresh_interval)
