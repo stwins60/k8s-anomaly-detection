@@ -171,17 +171,44 @@ def plot_logs(logs):
     plt.legend()
     st.pyplot(plt)
 
+# 📊 Visualize Log Distribution in Pie Chart
+def plot_logs_pie(logs):
+    if not logs:
+        st.warning("No logs available to display in the pie chart.")
+        return
+
+    # Aggregate logs by namespace or pod
+    namespace_counts = Counter(log["namespace"] for log in logs)
+
+    plt.figure(figsize=(8, 6))
+    plt.pie(
+        namespace_counts.values(), 
+        labels=namespace_counts.keys(), 
+        autopct="%1.1f%%", 
+        startangle=140, 
+        colors=plt.cm.Paired.colors
+    )
+    plt.title("Log Distribution by Namespace")
+    st.pyplot(plt)
+
 # 📊 Error Type Distribution
 def plot_error_distribution(errors):
+    if not errors:
+        st.warning("No errors to display in the pie chart.")
+        return
+
     error_types = [log["log"].split(" ")[0] for log in errors]  # Extract first word of log
     error_counts = Counter(error_types)
 
-    plt.figure(figsize=(10, 5))
-    plt.bar(error_counts.keys(), error_counts.values(), color="blue")
-    plt.xlabel("Error Type")
-    plt.ylabel("Frequency")
+    plt.figure(figsize=(8, 6))
+    plt.pie(
+        error_counts.values(), 
+        labels=error_counts.keys(), 
+        autopct="%1.1f%%", 
+        startangle=140, 
+        colors=plt.cm.Paired.colors
+    )
     plt.title("Error Type Distribution")
-    plt.xticks(rotation=45)
     st.pyplot(plt)
 
 # 🖥️ Streamlit UI Setup
@@ -224,7 +251,8 @@ if st.sidebar.button("🚀 Run Anomaly Detection"):
         send_slack_notification(alert_msg)  # Send Slack Alert
     
     st.subheader("📈 Log Trend Analysis")
-    plot_logs(anomaly_logs)
+    # plot_logs(anomaly_logs)
+    plot_logs_pie(anomaly_logs)
 
     st.subheader("📊 Error Type Distribution")
     plot_error_distribution(error_logs)
@@ -236,7 +264,8 @@ else:
     st.metric(label="Total Errors & Warnings", value=len(error_logs))
     # 📊 Visualization
     st.subheader("📈 Log Trend Analysis")
-    plot_logs(stored_logs)
+    # plot_logs(stored_logs)
+    plot_logs_pie(stored_logs)
 
     st.subheader("📊 Error Type Distribution")
     plot_error_distribution(error_logs)
