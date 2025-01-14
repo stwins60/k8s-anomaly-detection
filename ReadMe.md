@@ -57,6 +57,7 @@ GROQ_API_KEY=your_groq_api_key
 GROQ_ENDPOINT=https://api.groq.com/v1/chat/completions
 USE_GROQ=True
 SLACK_WEBHOOK_URL=your_slack_webhook
+SLACK_ENABLED=True
 EMAIL_ALERTS_ENABLED=True
 SMTP_SERVER=smtp.example.com
 SMTP_PORT=587
