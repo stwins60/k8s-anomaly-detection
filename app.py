@@ -27,7 +27,15 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_ENDPOINT = os.getenv("GROQ_ENDPOINT")
 USE_GROQ = os.getenv("USE_GROQ", "False").lower() == "true"  # Toggle AI calls
 ANOMALY_THRESHOLD = int(os.getenv("ANOMALY_THRESHOLD", 3))  # Threshold for anomaly alerts
-SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
+# SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL") if os.getenv("SLACK_ENABLED", "False").lower() == "true" else None
+
+# if os.getenv("SLACK_ENABLED", "False").lower() == "true" and not os.getenv("SLACK_WEBHOOK_URL"):
+#     raise ValueError("SLACK_WEBHOOK_URL is required for Slack notifications.")
+
+# if os.getenv("SLACK_ENABLED").lower() == "true":
+#     SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
+# else:
+#     SLACK_WEBHOOK_URL = None
 
 # Global registry for Prometheus metrics
 registry = CollectorRegistry()
@@ -108,11 +116,31 @@ def get_recent_logs(limit=100):
     conn.close()
     return logs
 
+# 📌 Format Logs for Slack
+def format_logs_for_slack(logs):
+    formatted_logs = ""
+    for log in logs:
+        pod = log.get('pod', 'N/A')
+        namespace = log.get('namespace', 'N/A')
+        timestamp = log.get('timestamp', 'N/A')
+        log_message = log.get('log', 'No log message')
+        
+        formatted_logs += f"*Pod*: {pod}\n*Namespace*: {namespace}\n*Timestamp*: {timestamp}\n*Log*: {log_message}\n\n"
+    return formatted_logs
+
 # 📌 Slack Notification
-def send_slack_notification(message):
-    if SLACK_WEBHOOK_URL:
+def send_slack_notification(message, st):
+    SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
+    SLACK_ENABLED = os.getenv("SLACK_ENABLED")
+
+    if SLACK_ENABLED == "True" and SLACK_WEBHOOK_URL:
         payload = {"text": message}
         requests.post(SLACK_WEBHOOK_URL, json=payload)
+    else:
+        st.warning("Slack notifications are disabled. Enable Slack notifications in the environment variables.")
+    # if SLACK_WEBHOOK_URL:
+    #     payload = {"text": message}
+    #     requests.post(SLACK_WEBHOOK_URL, json=payload)
 
 # 📌 Fetch Logs from Kubernetes API
 def fetch_live_k8s_logs():
@@ -137,7 +165,18 @@ def extract_errors_warnings(logs):
     error_patterns = [
         r'(?i)\b(error|failed|exception|crash|critical)\b',
         r'(?i)\b(timeout|unavailable|unreachable|rejected|connection refused)\b',
-        r'(?i)\b(unauthorized|forbidden|access denied)\b'
+        r'(?i)\b(unauthorized|forbidden|access denied)\b',
+        # Kubernetes-specific patterns
+        r'(?i)\b(pending|node not ready|pod not scheduled|evicted)\b',
+        r'(?i)\b(failed to start container|container terminated|image pull error)\b',
+        r'(?i)\b(unknown field|invalid configuration|unsupported config)\b',
+        r'(?i)\b(back-off restarting failed container|crashloopbackoff|oomkilled)\b',
+        r'(?i)\b(failed to create pod sandbox|failed to sync pod|volume mount error)\b',
+        r'(?i)\b(failed attach volume|failed to unmount volume|read-only filesystem)\b',
+        r'(?i)\b(dns lookup error|service not found|endpoint not available)\b',
+        r'(?i)\b(kubelet error|apiserver error|etcd timeout|etcd unavailable)\b',
+        r'(?i)\b(insufficient cpu|insufficient memory|insufficient resources)\b',
+        r'(?i)\b(node affinity mismatch|taint tolerated|no nodes available)\b'
     ]
     
     return [log for log in logs if any(re.search(pattern, log["log"]) for pattern in error_patterns)]
@@ -289,7 +328,11 @@ if st.sidebar.button("🚀 Run Anomaly Detection"):
     if len(anomaly_logs) >= ANOMALY_THRESHOLD:
         alert_msg = f"⚠️ High Anomaly Alert! {len(anomaly_logs)} anomalies found."
         st.error(alert_msg)
-        send_slack_notification(alert_msg)  # Send Slack Alert
+        # send meaningful alert to slack with the logs
+        formatted_logs = format_logs_for_slack(anomaly_logs)
+
+        msg = f"🚨 High Anomaly Alert! {len(anomaly_logs)} anomalies found:\n\n{formatted_logs}"
+        send_slack_notification(msg, st=st)
     
     st.subheader("📈 Log Trend Analysis")
     # plot_logs(anomaly_logs)
