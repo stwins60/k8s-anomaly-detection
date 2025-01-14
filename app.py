@@ -213,25 +213,39 @@ def detect_anomalies_ai(logs):
         return "No logs available for anomaly detection."
 
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-    
-    max_logs = min(50, len(logs))
-    logs_text = "\n".join([log["log"][:500] for log in logs[:max_logs]])
 
-    payload = {
-        "model": "mixtral-8x7b-32768",
-        "messages": [
-            {"role": "system", "content": "You are an AI that detects anomalies in Kubernetes logs."},
-            {"role": "user", "content": f"Identify unusual patterns in these logs:\n\n{logs_text}"}
-        ],
-        "max_tokens": 500
-    }
+    # Function to send a batch of logs
+    def send_batch(batch_logs):
+        logs_text = "\n".join([log["log"][:300] for log in batch_logs])  # Truncate logs to 300 characters
 
-    response = requests.post(GROQ_ENDPOINT, headers=headers, data=json.dumps(payload))
-    
-    if response.status_code == 200:
-        return response.json()["choices"][0]["message"]["content"]
-    else:
-        return f"Error: {response.json().get('error', {}).get('message', 'Unknown error')}"
+        payload = {
+            "model": "mixtral-8x7b-32768",
+            "messages": [
+                {"role": "system", "content": "You are an AI that detects anomalies in Kubernetes logs."},
+                {"role": "user", "content": f"Identify unusual patterns in these logs:\n\n{logs_text}"}
+            ],
+            "max_tokens": 500
+        }
+
+        response = requests.post(GROQ_ENDPOINT, headers=headers, data=json.dumps(payload))
+        
+        if response.status_code == 200:
+            return response.json()["choices"][0]["message"]["content"]
+        else:
+            return f"Error: {response.json().get('error', {}).get('message', 'Unknown error')}"
+
+    # Split logs into chunks of 10 logs each
+    chunk_size = 10
+    log_chunks = [logs[i:i + chunk_size] for i in range(0, len(logs), chunk_size)]
+
+    results = []
+    for chunk in log_chunks:
+        result = send_batch(chunk)
+        results.append(result)
+
+    return "\n".join(results)  # Combine the results of all chunks
+
+
     
 # 📊 Visualize Log Errors Over Time
 def plot_logs(logs):
@@ -248,14 +262,28 @@ def plot_logs(logs):
     st.pyplot(plt)
 
 # 📊 Visualize Log Distribution in Pie Chart
-def plot_logs_pie(logs):
+def plot_logs_pie(logs, st):
     if not logs:
         st.warning("No logs available to display in the pie chart.")
         return
 
-    # Aggregate logs by namespace or pod
-    namespace_counts = Counter(log["namespace"] for log in logs)
+    # Regular expression to extract namespace from log text
+    namespace_pattern = re.compile(r"namespace\s*=\s*(\S+)")  # Modify this to match your log format
+    namespaces = []
 
+    for log in logs:
+        match = namespace_pattern.search(log["log"])  # Assuming log["log"] contains the log text
+        if match:
+            namespaces.append(match.group(1))
+    
+    if not namespaces:
+        st.warning("No namespaces found in the logs.")
+        return
+    
+    # Aggregate logs by namespace
+    namespace_counts = Counter(namespaces)
+
+    # Plot the pie chart
     plt.figure(figsize=(8, 6))
     plt.pie(
         namespace_counts.values(), 
@@ -318,25 +346,35 @@ error_logs = extract_errors_warnings(stored_logs)
 # Detect Anomalies Based on Selected Method
 if st.sidebar.button("🚀 Run Anomaly Detection"):
     st.subheader("🚨 Anomaly Detection Results")
-    anomaly_logs = detect_anomalies_locally(stored_logs) if anomaly_detection_method == "Local (TF-IDF & K-Means)" else detect_anomalies_ai(stored_logs)
+    # anomaly_logs = detect_anomalies_locally(stored_logs) if anomaly_detection_method == "Local (TF-IDF & K-Means)" else detect_anomalies_ai(stored_logs)
+    if anomaly_detection_method == "Local (TF-IDF & K-Means)": 
+        anomaly_logs = detect_anomalies_locally(stored_logs)
+        st.write(pd.DataFrame(anomaly_logs))
+    else:
+        anomaly_logs = detect_anomalies_ai(stored_logs)
+        st.write(anomaly_logs)
 
     # anomaly_metric.set(len(anomaly_logs))
 
-    st.write(pd.DataFrame(anomaly_logs))
+    # st.write(pd.DataFrame(anomaly_logs))
 
     # Alert if anomalies exceed threshold
     if len(anomaly_logs) >= ANOMALY_THRESHOLD:
         alert_msg = f"⚠️ High Anomaly Alert! {len(anomaly_logs)} anomalies found."
         st.error(alert_msg)
-        # send meaningful alert to slack with the logs
-        formatted_logs = format_logs_for_slack(anomaly_logs)
 
+        if anomaly_detection_method == "Local (TF-IDF & K-Means)":
+        # send meaningful alert to slack with the logs
+            formatted_logs = format_logs_for_slack(anomaly_logs)
+        else:
+            formatted_logs = anomaly_logs
+            
         msg = f"🚨 High Anomaly Alert! {len(anomaly_logs)} anomalies found:\n\n{formatted_logs}"
         send_slack_notification(msg, st=st)
     
     st.subheader("📈 Log Trend Analysis")
     # plot_logs(anomaly_logs)
-    plot_logs_pie(anomaly_logs)
+    plot_logs_pie(anomaly_logs, st)
 
     st.subheader("📊 Error Type Distribution")
     plot_error_distribution(error_logs)
@@ -349,7 +387,7 @@ else:
     # 📊 Visualization
     st.subheader("📈 Log Trend Analysis")
     # plot_logs(stored_logs)
-    plot_logs_pie(stored_logs)
+    plot_logs_pie(stored_logs, st)
 
     st.subheader("📊 Error Type Distribution")
     plot_error_distribution(error_logs)
