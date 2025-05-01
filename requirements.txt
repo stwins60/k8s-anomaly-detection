@@ -8,3 +8,4 @@ matplotlib
 numpy
 pandas
 prometheus_client
+transformers>=4.50.0 # not directly required, pinned by Snyk to avoid a vulnerability
