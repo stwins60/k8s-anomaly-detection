@@ -1,0 +1,10 @@
+streamlit
+boto3
+botocore
+python-dotenv
+kubernetes
+pandas
+matplotlib
+scikit-learn
+prometheus-client
+requests
